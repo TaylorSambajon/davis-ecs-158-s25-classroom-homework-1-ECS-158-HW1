@@ -26,7 +26,7 @@ func TestBasic(t *testing.T) {
 	if result[0].RName != "www.mvirtualnet.com.br" {
 		t.Errorf("Wrong query")
 	}
-	if result[0].RData != "199.46.34.124" {
+	if result[0].RData != "191.241.53.61" {
 		t.Errorf("Wrong query")
 	}
 }
@@ -56,6 +56,10 @@ func TestNameHash(t *testing.T) {
 func initTestsData(n uint) {
 	InitCache(n)
 	InitServerComm(n)
+
+	commLock.Lock()
+	defer commLock.Unlock()
+	commData = make(map[string]bool)
 }
 
 // This is A-records: Given a name whats its IP
@@ -174,7 +178,7 @@ func simpleCommManager(addr *netip.Addr) *serverCommManager {
 	return &manager
 }
 
-func create_answer(tld string) *DNSMessage {
+func createAnswer(tld string) *DNSMessage {
 	msg := &DNSMessage{
 		Header:      DNSHeader{},
 		Question:    DNSQuestion{},
@@ -275,7 +279,7 @@ func get_result(addr string, request *serverDNSRequest) {
 			cut, _ := strings.CutSuffix(request.name, "."+domain)
 			if !strings.Contains(cut, ".") {
 				go func() {
-					request.response <- create_answer(request.name)
+					request.response <- createAnswer(request.name)
 				}()
 				return
 			}
@@ -295,7 +299,7 @@ func get_result(addr string, request *serverDNSRequest) {
 				suffix = remains[len(remains)-1] + "." + suffix
 			}
 			go func() {
-				request.response <- create_answer(request.name)
+				request.response <- createAnswer(request.name)
 			}()
 			return
 		}
@@ -335,5 +339,55 @@ func TestCommManager(t *testing.T) {
 		fmt.Printf("%v\n", msg)
 	case <-time.After(5 * time.Second):
 		fmt.Printf("timeout\n")
+	}
+}
+
+func getCommTestInternal(server string, t *testing.T) {
+	addr, _ := netip.ParseAddr(server)
+	manager := getServerComm(&(addr))
+	if manager == nil {
+		t.Errorf("Unable to find server")
+		return
+	}
+	if manager.remote.String() != server {
+		t.Errorf("Incorrect server")
+	}
+}
+
+func commManagerTestInternal(cacheSize uint, iterations int, t *testing.T) {
+	initTestsData(cacheSize)
+	commConnect = simpleCommManager
+	done := make(chan bool)
+	for server, _ := range ipnameservers {
+		for range iterations {
+			go func() {
+				getCommTestInternal(server, t)
+				done <- true
+			}()
+		}
+	}
+	for range ipnameservers {
+		for range iterations {
+			select {
+			case <-done:
+
+			case <-time.After(5 * time.Second):
+				t.Errorf("timeout")
+				return
+			}
+		}
+	}
+}
+
+// Here is a set of unit tests for getServerCommManager
+// Given we are dealing with race condition bugs we want to really, REALLY
+// hammer things so thus the many loops...
+func TestGetCommManager(t *testing.T) {
+	loadJsonFile("../data/50-lookups.json")
+	for range 50 {
+		commManagerTestInternal(1, 1, t)
+		commManagerTestInternal(1024, 1, t)
+		commManagerTestInternal(1, 100, t)
+		commManagerTestInternal(1024, 100, t)
 	}
 }
