@@ -455,3 +455,43 @@ func TestLotsLookups(t *testing.T) {
 	}
 
 }
+
+func TestLotsLookups2(t *testing.T) {
+	loadJsonFile("../data/bulk.json")
+	initTestsData(32)
+
+	answer := QueryLookup("a.root-servers.net", RTYPE_A)
+	if answer == nil || len(answer) == 0 {
+		t.Errorf("Unable to find answer")
+	}
+	if answer[0].RData.(A_RECORD).A.String() != "198.41.0.4" {
+		t.Errorf("Wrong answer, expected 198.41.0.4 got %v", answer[0].RData.(A_RECORD).A.String())
+	}
+	i := 0
+	done := make(chan bool)
+	for name, _ := range names {
+		if i > 4096 {
+			break
+		}
+		i++
+		go func() {
+			QueryLookup(name, RTYPE_A)
+			done <- true
+		}()
+	}
+	i = 0
+	for range names {
+		if i > 4096 {
+			break
+		}
+		i++
+		select {
+		case <-time.After(5 * time.Second):
+			t.Errorf("timeout")
+			return
+		case <-done:
+		}
+
+	}
+
+}
