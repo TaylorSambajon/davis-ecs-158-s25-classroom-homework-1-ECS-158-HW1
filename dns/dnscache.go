@@ -13,7 +13,7 @@ import (
 // expires time and the rdata itself.
 type dnsCacheEntry struct {
 	expires time.Time
-	data    []*RDATA
+	data    []RDATA // Changed type signature
 }
 
 // dnsCacheUnit This is our basic unit of locking within
@@ -50,9 +50,9 @@ func InitCache(n uint) {
 }
 
 func initRoot() {
-	rootNS := &NS_RECORD{"a.root-servers.net."}
+	rootNS := NS_RECORD{"a.root-servers.net."}
 	a, _ := netip.ParseAddr("198.41.0.4")
-	rootIP := &A_RECORD{a}
+	rootIP := A_RECORD{a}
 	cacheSet(".", RTYPE_NS,
 		time.Now().Add(time.Hour*24*365),
 		[]RDATA{rootNS})
@@ -75,6 +75,8 @@ func cacheLookup(name string, t RTYPE) *dnsCacheEntry {
 // cacheSet This will set a mapping of name/type to RDATA.
 // It needs to be thread safe BUT its ok to do additional redundant setting
 // if something else at the same time wants to update the data.
+// If you want you can add on to the existing data if it makes your life
+// easier.
 func cacheSet(name string, t RTYPE, expires time.Time, data []RDATA) {
 	// TODO: You need to implement this to make sure it is thread safe
 	return

@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+func parseAddrNoerror(addr string) netip.Addr {
+	tmp, _ := netip.ParseAddr(addr)
+	return tmp
+}
+
 func TestBasic(t *testing.T) {
 	initTestsData(1)
 	loadJsonFile("../data/50-lookups.json")
@@ -26,7 +31,10 @@ func TestBasic(t *testing.T) {
 	if result[0].RName != "www.mvirtualnet.com.br" {
 		t.Errorf("Wrong query")
 	}
-	if result[0].RData != "191.241.53.61" {
+	// Realize I had a stupidity and was assuming this should be a string
+	// but the proper RData for A is A_RECORD, so this is checking that
+	// the A_Record is correct.
+	if result[0].RData.(A_RECORD).A != parseAddrNoerror("191.241.53.61") {
 		t.Errorf("Wrong query")
 	}
 }
@@ -56,7 +64,7 @@ func TestNameHash(t *testing.T) {
 func initTestsData(n uint) {
 	InitCache(n)
 	InitServerComm(n)
-
+	commConnect = simpleCommManager
 	commLock.Lock()
 	defer commLock.Unlock()
 	commData = make(map[string]bool)
@@ -171,7 +179,6 @@ func simpleCommManager(addr *netip.Addr) *serverCommManager {
 	go func() {
 		for true {
 			request := <-manager.requests
-			fmt.Printf("%v\n", request)
 			go get_result(addr.String(), request)
 		}
 	}()
@@ -194,20 +201,19 @@ func createAnswer(tld string) *DNSMessage {
 				RName:  tld,
 				RType:  RTYPE_A,
 				RClass: 0,
-				RData:  arecord,
+				RData:  A_RECORD{parseAddrNoerror(arecord)},
 			})
 		}
 	} else {
-		cnames, ok := cnames[tld]
+		cname, ok := cnames[tld]
 		if ok {
-			for _, cname := range cnames {
-				msg.Answers = append(msg.Answers, DNSAnswer{
-					RName:  tld,
-					RType:  RTYPE_CNAME,
-					RClass: 0,
-					RData:  cname,
-				})
-			}
+			msg.Answers = append(msg.Answers, DNSAnswer{
+				RName:  tld,
+				RType:  RTYPE_CNAME,
+				RClass: 0,
+				RData:  CNAME_RECORD{cname},
+			})
+
 		} else {
 			msg.Header.Status = RCODE_NXNAME
 		}
@@ -219,7 +225,6 @@ func createAnswer(tld string) *DNSMessage {
 func create_ns(tld string) *DNSMessage {
 	ns, ok := nameservers[tld]
 
-	fmt.Printf("Root Query %v\n", ns)
 	msg := &DNSMessage{
 		Header:      DNSHeader{},
 		Question:    DNSQuestion{},
@@ -239,7 +244,7 @@ func create_ns(tld string) *DNSMessage {
 			RName:  tld,
 			RType:  RTYPE_NS,
 			RClass: 0,
-			RData:  server,
+			RData:  NS_RECORD{server},
 		}
 		msg.Authorities = append(msg.Authorities, a)
 
@@ -249,7 +254,8 @@ func create_ns(tld string) *DNSMessage {
 
 				RType:  RTYPE_A,
 				RClass: 0,
-				RData:  glue}
+				RData:  A_RECORD{parseAddrNoerror(glue)},
+			}
 			msg.Additionals = append(msg.Additionals, g)
 		}
 	}
@@ -263,10 +269,15 @@ func get_result(addr string, request *serverDNSRequest) {
 		tld := query[len(query)-1]
 		_, ok := nameservers[tld]
 		if !ok {
+			if len(query) < 2 {
+				fmt.Printf("Unable to find domain %s\n", tld)
+				return
+			}
 			tld = query[len(query)-2] + "." + query[len(query)-1]
 			_, ok := nameservers[query[len(query)-2]+"."+query[len(query)-1]]
 			if !ok {
-				fmt.Printf("Unable to find domain")
+				fmt.Printf("Unable to find domain %s\n", tld)
+				return // Trigger a timeout.
 			}
 		}
 		go func() {
@@ -335,10 +346,8 @@ func TestCommManager(t *testing.T) {
 	ns = simpleCommManager(&ip)
 	ns.requests <- request
 	select {
-	case msg := <-request.response:
-		fmt.Printf("%v\n", msg)
+	case <-request.response:
 	case <-time.After(5 * time.Second):
-		fmt.Printf("timeout\n")
 	}
 }
 
@@ -390,4 +399,59 @@ func TestGetCommManager(t *testing.T) {
 		commManagerTestInternal(1, 100, t)
 		commManagerTestInternal(1024, 100, t)
 	}
+	loadJsonFile("../data/bulk.json")
+	commManagerTestInternal(1024, 2, t)
+}
+
+func TestCacheLookups(t *testing.T) {
+	loadJsonFile("../data/bulk.json")
+	initTestsData(1024)
+	answer := QueryLookup("a.root-servers.net", RTYPE_A)
+	if answer == nil || len(answer) == 0 {
+		t.Errorf("Unable to find answer")
+	}
+	if answer[0].RData.(A_RECORD).A.String() != "198.41.0.4" {
+		t.Errorf("Wrong answer, expected 198.41.0.4 got %v", answer[0].RData.(A_RECORD).A.String())
+	}
+
+}
+
+func TestLotsLookups(t *testing.T) {
+	loadJsonFile("../data/bulk.json")
+	initTestsData(1024)
+
+	answer := QueryLookup("a.root-servers.net", RTYPE_A)
+	if answer == nil || len(answer) == 0 {
+		t.Errorf("Unable to find answer")
+	}
+	if answer[0].RData.(A_RECORD).A.String() != "198.41.0.4" {
+		t.Errorf("Wrong answer, expected 198.41.0.4 got %v", answer[0].RData.(A_RECORD).A.String())
+	}
+	i := 0
+	done := make(chan bool)
+	for name, _ := range names {
+		if i > 4096 {
+			break
+		}
+		i++
+		go func() {
+			QueryLookup(name, RTYPE_A)
+			done <- true
+		}()
+	}
+	i = 0
+	for range names {
+		if i > 4096 {
+			break
+		}
+		i++
+		select {
+		case <-time.After(5 * time.Second):
+			t.Errorf("timeout")
+			return
+		case <-done:
+		}
+
+	}
+
 }

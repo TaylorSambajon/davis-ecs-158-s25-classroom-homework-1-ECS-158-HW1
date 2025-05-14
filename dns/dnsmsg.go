@@ -100,6 +100,7 @@ func (q DNSQuestion) String() string {
 }
 
 type RDATA interface {
+	Dummy()
 }
 
 type SOA_RECORD struct {
@@ -111,16 +112,37 @@ type SOA_RECORD struct {
 	Expire  uint32 `json:"expire"`
 }
 
+func (r SOA_RECORD) Dummy() {
+
+}
+
 type NS_RECORD struct {
 	NS string `json:"ns"`
+}
+
+func (N NS_RECORD) Dummy() {
+}
+
+type CNAME_RECORD struct {
+	CNAME string `json:"cname"`
+}
+
+func (C CNAME_RECORD) Dummy() {
+	//TODO implement
 }
 
 type A_RECORD struct {
 	A netip.Addr `json:"a"`
 }
 
+func (a A_RECORD) Dummy() {
+}
+
 type AAAA_RECORD struct {
 	AAAA netip.Addr `json:"aaaa"`
+}
+
+func (A AAAA_RECORD) Dummy() {
 }
 
 func (r SOA_RECORD) String() string {
