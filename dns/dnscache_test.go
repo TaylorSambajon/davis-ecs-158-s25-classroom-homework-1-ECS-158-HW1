@@ -306,8 +306,13 @@ func get_result(addr string, request *serverDNSRequest) {
 					return
 				}
 				remains = strings.Split(current, ".")
-				current, _ = strings.CutSuffix(current, "."+suffix)
-				suffix = remains[len(remains)-1] + "." + suffix
+				tail := remains[len(remains)-1]
+				suffix = tail + "." + suffix
+				if len(remains) == 1 {
+					current = ""
+				} else {
+					current, _ = strings.CutSuffix(current, "."+tail)
+				}
 			}
 			go func() {
 				request.response <- createAnswer(request.name)
