@@ -2,6 +2,7 @@ package dns
 
 import (
 	"crypto/rand"
+	"fmt"
 	"hash/fnv"
 	"net/netip"
 	"strings"
@@ -68,7 +69,41 @@ func initRoot() {
 // the given name and rtype.  If the name doesn't exist, the rtype
 // doesn't exist, or the record is expired it should return nil
 func cacheLookup(name string, t RTYPE) *dnsCacheEntry {
-	// TODO: You need to implement this and make sure this is thread safe.
+	//get cache index
+	index := nameHash(name) % uint32(len(dnsCache))
+	cacheUnit := dnsCache[index]
+
+	/*if strings.Contains(name, "cloudflare.net") {
+		fmt.Printf("CacheLookup: [%s] type %v\n", name, t)
+	}*/
+
+	//begin lookup
+	//lock
+	cacheUnit.lock.RLock()
+	defer cacheUnit.lock.RUnlock() //unlock when done
+
+	//fmt.Println("cacheLookup: Searching for", name, "of type", t)
+	//check for name, make sure it exists
+	if nameMap, exist := cacheUnit.entries[name]; exist {
+		//fmt.Println("cacheLookup:", name, "found! Looking for entry...")
+		//check for data and expiry
+		if daEntry, exist := nameMap[t]; exist && !daEntry.isExpired() {
+			//hooray we did it!
+			if strings.Contains(name, "cloudflare.net") {
+				fmt.Println("HIT")
+			}
+			return daEntry
+		} else {
+			//fmt.Println("Entry does not exist or is expired.")
+		}
+	} else {
+		//fmt.Println("Unit does not exist.")
+	}
+
+	//couldn't find... sad...
+	/*if strings.Contains(name, "cloudflare.net") {
+		fmt.Println("MISS")
+	}*/
 	return nil
 }
 
@@ -78,8 +113,42 @@ func cacheLookup(name string, t RTYPE) *dnsCacheEntry {
 // If you want you can add on to the existing data if it makes your life
 // easier.
 func cacheSet(name string, t RTYPE, expires time.Time, data []RDATA) {
-	// TODO: You need to implement this to make sure it is thread safe
-	return
+	//get unit again
+	index := nameHash(name) % uint32(len(dnsCache))
+	daUnit := dnsCache[index]
+
+	//fmt.Println("cacheSet: index is", index)
+	//lock it!! we're writing
+	daUnit.lock.Lock()
+	defer daUnit.lock.Unlock()
+
+	//make the entry
+	//fmt.Println("cacheSet: Make new entry...")
+	newEntry := &dnsCacheEntry{
+		expires: expires,
+		data:    data,
+	}
+
+	//write entry to unit
+	//make sure it aint nil
+	if daUnit.entries == nil {
+		daUnit.entries = make(map[string]map[RTYPE]*dnsCacheEntry)
+	}
+
+	//check for name
+	if _, exist := daUnit.entries[name]; !exist {
+		//make new one baybee
+		daUnit.entries[name] = make(map[RTYPE]*dnsCacheEntry)
+	}
+
+	daUnit.entries[name][t] = newEntry
+	if strings.Contains(name, "cloudflare.net") {
+		fmt.Printf("Cache set: [%s] type %v\n", name, t)
+		for _, da := range data {
+			fmt.Printf(" -> data: %+v\n", da)
+		}
+	}
+
 }
 
 // nameHash This is a basic hash function for strings.
@@ -115,8 +184,187 @@ func serverHash(addr *netip.Addr) uint32 {
 // If the value is a CNAME it should also follow the CNAME and return that as part of
 // the answer.  For now we will only deal with RTYPE_A records
 func QueryLookup(name string, t RTYPE) []*DNSAnswer {
-	// TODO You need to implement this
-	return nil
+	//init answer array
+	daAnswers := []*DNSAnswer{}
+
+	//the lookup itself!!
+	//append "." to end of name
+	if !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	//fmt.Println("QueryLookup: searching for", name, "of type", t)
+	cacheEntryGet := cacheLookup(name, t)
+	if cacheEntryGet != nil {
+		//copy stuff
+		cacheEntrydata := make([]RDATA, len(cacheEntryGet.data))
+		copy(cacheEntrydata, cacheEntryGet.data)
+		for _, datapiece := range cacheEntrydata {
+			daAnswers = append(daAnswers, &DNSAnswer{
+				RName: name, RType: t,
+				RClass: 1, RData: datapiece,
+			})
+		}
+
+	} else { //if the name doesn't exist...
+		//fmt.Println("Not found yet!")
+		suffArr := chopName(name) //get suffixes
+
+		//same, but NS this time
+		for _, x := range suffArr {
+
+			//fmt.Println("Searching for", x)
+			cacheEntryGet = cacheLookup(x, RTYPE_NS)
+
+			if cacheEntryGet != nil {
+				//we found one!
+				cacheEntrydata := make([]RDATA, len(cacheEntryGet.data))
+				copy(cacheEntrydata, cacheEntryGet.data)
+				for _, datapiece := range cacheEntrydata {
+					//get da new name
+					newName := datapiece.(NS_RECORD).NS
+
+					daEntry := cacheLookup(newName, RTYPE_A)
+					if daEntry != nil {
+						//yay
+						//fmt.Println("iterating found entry for a record")
+						for _, daData := range daEntry.data {
+							//fmt.Println("here's da data:", daData)
+
+							//retrieving address and establishing comm
+							addr := daData.(A_RECORD).A
+							//fmt.Println("here's da record:", addr)
+
+							//get communication
+							var newAddr netip.Addr
+							//tryMe := make([]netip.Addr, 0)
+							//notCaught := make([]string, 0)
+							count := 0
+							for {
+								if count > 20 {
+									fmt.Println("Too many loops. Breaking.")
+									break
+								}
+								count++
+								checkCache := cacheLookup(name, t)
+								if checkCache != nil {
+									cacheEntrydata := make([]RDATA, len(checkCache.data))
+									copy(cacheEntrydata, checkCache.data)
+									for _, datapiece := range cacheEntrydata {
+										daAnswers = append(daAnswers, &DNSAnswer{
+											RName: name, RType: t,
+											RClass: 1, RData: datapiece,
+										})
+									}
+									return daAnswers
+								}
+								serverComm := getServerComm(&addr)
+								//if serverComm == nil {
+								//	serverComm = establishServerComm(&addr)
+								//}
+
+								//fetch request from server
+								reqName := name[0 : len(name)-1]
+								//fmt.Println("Making request for", reqName)
+								request := &serverDNSRequest{
+									name: reqName, qtype: t,
+									response: make(chan *DNSMessage),
+								}
+
+								//get da response/respo
+								serverComm.requests <- request
+								respo := <-request.response
+
+								//begin da parse
+								if respo.Header.Status != RCODE_OK {
+									return nil
+								}
+								if respo == nil || (len(respo.Answers) == 0 && len(respo.Authorities) == 0 && len(respo.Additionals) == 0) {
+									//fmt.Println("Response is nil")
+									return nil
+								} else {
+
+									if len(respo.Answers) != 0 {
+										//fmt.Println("BRO WE'RE GONNA HAVE TO deal with this later")
+										for i := range respo.Answers {
+											daAnswers = append(daAnswers, &respo.Answers[i])
+										}
+										return daAnswers
+									}
+
+									for _, auth := range respo.Authorities {
+										setAuthAdd(auth)
+									}
+									for _, addit := range respo.Additionals {
+										setAuthAdd(addit)
+									}
+
+									//then search additionals!
+									found := false
+									for _, authEntry := range respo.Authorities {
+
+										nsRDat, exist := authEntry.RData.(NS_RECORD) //check for name exists
+										if !exist {
+											continue
+										}
+
+										if len(respo.Additionals) != 0 { //check for legitimate additional list
+
+											//fmt.Println("Additionals are:", respo.Additionals)
+											for _, additEntry := range respo.Additionals { //searching additionals
+
+												//find A_Record
+												arec, exist := additEntry.RData.(A_RECORD)
+												if !exist {
+													continue
+												}
+												//make sure it's the right one
+												if additEntry.RName == nsRDat.NS {
+													newAddr = arec.A
+													found = true
+													break
+												}
+
+											} //end check additionals for
+
+										} else {
+											//panic("ruh roh raggy (no additionals found lol)")
+											fmt.Println("No additionals!")
+											daAnswers = QueryLookup(nsRDat.NS, RTYPE_A)
+										} //end additional if check
+
+										if found {
+											break
+										}
+									}
+
+									if newAddr == addr {
+										fmt.Println("No improvement.")
+										break
+									}
+									addr = newAddr
+
+								} //end response parse if
+
+							} //end IP iterative for
+
+						} //end data search for
+
+					} //end valid entry if
+
+				} //end copy for
+
+				//break //woohooo
+			} //end found if
+
+		} //end suffix array search
+
+		//look one more time my guy TRUST
+		if cacheLookup(name, t) != nil {
+			daAnswers = QueryLookup(name, t)
+		}
+	} //end iterative lookup
+
+	return daAnswers
 }
 
 // The protocol for generating a request to a server:
@@ -160,8 +408,25 @@ func InitServerComm(n uint) {
 }
 
 func getServerComm(addr *netip.Addr) *serverCommManager {
-	// TODO you need to implement this
-	return nil
+	//thread safe(?)
+	index := serverHash(addr) % uint32(len(serverCommCache))
+	commUnit := serverCommCache[index]
+
+	//lock while checking. uhhh i wasn't told to but
+	//just in case hoho
+	commUnit.lock.RLock()
+
+	//does it exist?
+	c, exist := commUnit.entries[*addr]
+	commUnit.lock.RUnlock()
+
+	if exist {
+		return c
+	}
+
+	//unlock then establish if no
+	c = establishServerComm(addr)
+	return c
 }
 
 // This needs to be safe:  It needs to acquire a write lock and first
@@ -169,7 +434,33 @@ func getServerComm(addr *netip.Addr) *serverCommManager {
 // If there isn't it should invoke commConnect to get the new server manager
 // to be set/returned.
 func establishServerComm(addr *netip.Addr) *serverCommManager {
-	// TODO you need to implement this.
+	//needs a write lock lol let's get that first
+	index := serverHash(addr) % uint32(len(serverCommCache))
+	commUnit := serverCommCache[index]
+
+	commUnit.lock.Lock()
+	defer commUnit.lock.Unlock()
+
+	//lock acquired
+	//fmt.Println("establishServerComm: commConnect to", addr)
+	//check if exists
+	if commExist, exist := commUnit.entries[*addr]; exist {
+		return commExist
+	} else {
+		commMan := commConnect(addr)
+		if commMan != nil {
+
+			//set new communication manager
+			if commUnit.entries == nil {
+				//fmt.Println("New map made for", addr)
+				commUnit.entries = make(map[netip.Addr]*serverCommManager)
+			}
+			commUnit.entries[*addr] = commMan
+			return commMan
+		} //end nil comm if
+	} //end exist if
+
+	//fmt.Println("establishServerComm: could not find", addr)
 	return nil
 }
 
@@ -183,3 +474,46 @@ func establishServerComm(addr *netip.Addr) *serverCommManager {
 
 // For now we only accept IPv4 (A) record based addresses.
 var commConnect func(*netip.Addr) *serverCommManager
+
+// helper functions go here
+// check if expired
+func (c *dnsCacheEntry) isExpired() bool {
+	return time.Now().After(c.expires)
+}
+
+// chop up to "." in name
+// be searched!
+func chopName(name string) []string {
+	var chopped []string
+	pieces := strings.Split(name, ".")
+
+	//get suffArray
+	for i := range pieces {
+		suff := strings.Join(pieces[i:], ".")
+		if suff != "" {
+			chopped = append(chopped, suff+".")
+		} else {
+			//accounts for trailing dot at end
+			chopped = append(chopped, ".")
+		}
+	}
+	return chopped //put it back
+}
+
+// makes setting the cache easier in QueryLookup
+func setAuthAdd(entry DNSAnswer) {
+	//fmt.Println("Info for current entry- Name:", entry.RName, "Type:", entry.RType, "Class:", entry.RClass, "Data:", entry.RData)
+	name := entry.RName
+
+	if !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	//caching found entry
+	//exist := cacheLookup(name, entry.RType)
+
+	if strings.Contains(name, "cloudflare.net") {
+		fmt.Printf("Set auth/add: [%s] type %v\n", entry.RName, entry.RType)
+	}
+	cacheSet(name, entry.RType, time.Now().Add(time.Hour*24*365), []RDATA{entry.RData})
+
+}
