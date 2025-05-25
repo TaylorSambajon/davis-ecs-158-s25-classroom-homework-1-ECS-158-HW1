@@ -189,10 +189,10 @@ func QueryLookup(name string, t RTYPE) []*DNSAnswer {
 
 	//the lookup itself!!
 	//append "." to end of name
-	if !strings.HasSuffix(name, ".") {
+	if !strings.HasSuffix(name, ".") || name == "" {
 		name += "."
 	}
-	//fmt.Println("QueryLookup: searching for", name, "of type", t)
+	fmt.Println("QueryLookup: searching for", name, "of type", t)
 	cacheEntryGet := cacheLookup(name, t)
 	if cacheEntryGet != nil {
 		//copy stuff
@@ -206,162 +206,115 @@ func QueryLookup(name string, t RTYPE) []*DNSAnswer {
 		}
 
 	} else { //if the name doesn't exist...
-		//fmt.Println("Not found yet!")
+		//get suffixes and name
 		suffArr := chopName(name) //get suffixes
+		bestName := getBest(suffArr)
+		fmt.Println("Searching for", bestName)
+		bestNS := cacheLookup(bestName, RTYPE_NS)
+		for _, datapiece := range bestNS.data {
+			//get da new name
+			nsName := datapiece.(NS_RECORD).NS
+			if !strings.HasSuffix(nsName, ".") {
+				nsName += "."
+			}
+			fmt.Println("Current NS:", nsName)
+			bnARec := cacheLookup(nsName, RTYPE_A)
+			if bnARec == nil { //if does not exist, move to next one
+				fmt.Println(nsName, " was empty")
+				continue
+			}
+			if len(bnARec.data) == 0 { //if data is nil go to next one, this one is unusable
+				fmt.Println("No data in", nsName)
+				continue
+			}
+			//else we press on
 
-		//same, but NS this time
-		for _, x := range suffArr {
+			//retrieving address and establishing comm
+			addr := bnARec.data[0].(A_RECORD).A //only use first one
+			serverComm := getServerComm(&addr)
 
-			//fmt.Println("Searching for", x)
-			cacheEntryGet = cacheLookup(x, RTYPE_NS)
+			//fetch request from server
+			reqName := name
+			if strings.HasSuffix(reqName, ".") {
+				reqName = strings.TrimSuffix(reqName, ".")
+			}
+			request := &serverDNSRequest{
+				name: reqName, qtype: t,
+				response: make(chan *DNSMessage),
+			}
+			serverComm.requests <- request
 
-			if cacheEntryGet != nil {
-				//we found one!
-				cacheEntrydata := make([]RDATA, len(cacheEntryGet.data))
-				copy(cacheEntrydata, cacheEntryGet.data)
-				for _, datapiece := range cacheEntrydata {
-					//get da new name
-					newName := datapiece.(NS_RECORD).NS
+			//wait on request, time out if too long...
+			select {
+			case <-time.After(3 * time.Second): //timeout
+				return nil
+			case respo := <-request.response:
+				//begin da parse
+				if respo.Header.Status != RCODE_OK {
+					return nil
+				}
+				if respo == nil || (len(respo.Answers) == 0 && len(respo.Authorities) == 0 && len(respo.Additionals) == 0) {
+					//fmt.Println("Response is nil")
+					return nil
+				}
 
-					daEntry := cacheLookup(newName, RTYPE_A)
-					if daEntry != nil {
-						//yay
-						//fmt.Println("iterating found entry for a record")
-						for _, daData := range daEntry.data {
-							//fmt.Println("here's da data:", daData)
+				fmt.Println("Caching: ANSWERS")
+				for _, ans := range respo.Answers {
+					setAnsAuthAdd(ans)
+				}
+				fmt.Println("Caching: AUTHORITIES")
+				for _, auth := range respo.Authorities {
+					setAnsAuthAdd(auth)
+				}
+				fmt.Println("Caching: ADDITIONALS")
+				for _, addit := range respo.Additionals {
+					setAnsAuthAdd(addit)
+				}
+				if len(respo.Answers) > 0 {
+					for _, ans := range respo.Answers {
+						daAnswers = append(daAnswers, &ans)
+					}
+					return daAnswers
+				}
 
-							//retrieving address and establishing comm
-							addr := daData.(A_RECORD).A
-							//fmt.Println("here's da record:", addr)
+				//check if cached
+				fmt.Println("Searching request for", name)
+				answer := cacheLookup(name, t)
+				if answer != nil {
+					answerData := make([]RDATA, len(answer.data))
+					copy(answerData, answer.data)
+					for _, datapiece := range answer.data {
+						daAnswers = append(daAnswers, &DNSAnswer{
+							RName: name, RType: t,
+							RClass: 1, RData: datapiece,
+						})
+					}
 
-							//get communication
-							var newAddr netip.Addr
-							//tryMe := make([]netip.Addr, 0)
-							//notCaught := make([]string, 0)
-							count := 0
-							for {
-								if count > 20 {
-									fmt.Println("Too many loops. Breaking.")
-									break
-								}
-								count++
-								checkCache := cacheLookup(name, t)
-								if checkCache != nil {
-									cacheEntrydata := make([]RDATA, len(checkCache.data))
-									copy(cacheEntrydata, checkCache.data)
-									for _, datapiece := range cacheEntrydata {
-										daAnswers = append(daAnswers, &DNSAnswer{
-											RName: name, RType: t,
-											RClass: 1, RData: datapiece,
-										})
-									}
-									return daAnswers
-								}
-								serverComm := getServerComm(&addr)
-								//if serverComm == nil {
-								//	serverComm = establishServerComm(&addr)
-								//}
+					return daAnswers
+				}
 
-								//fetch request from server
-								reqName := name[0 : len(name)-1]
-								//fmt.Println("Making request for", reqName)
-								request := &serverDNSRequest{
-									name: reqName, qtype: t,
-									response: make(chan *DNSMessage),
-								}
+				newBestName := getBest(suffArr)
+				fmt.Println("Best name:", bestName, "New best name:", newBestName)
+				if newBestName == bestName {
+					//we tried
+					fmt.Println("No new name")
+					return nil
+				}
+				newNS := cacheLookup(newBestName, RTYPE_NS)
+				if newNS == nil {
+					fmt.Println("No NS records for", newNS)
+					return nil
+				}
+				return QueryLookup(name, t)
 
-								//get da response/respo
-								serverComm.requests <- request
-								respo := <-request.response
+			} //end select case
 
-								//begin da parse
-								if respo.Header.Status != RCODE_OK {
-									return nil
-								}
-								if respo == nil || (len(respo.Answers) == 0 && len(respo.Authorities) == 0 && len(respo.Additionals) == 0) {
-									//fmt.Println("Response is nil")
-									return nil
-								} else {
+		} //end searching for NS
 
-									if len(respo.Answers) != 0 {
-										//fmt.Println("BRO WE'RE GONNA HAVE TO deal with this later")
-										for i := range respo.Answers {
-											daAnswers = append(daAnswers, &respo.Answers[i])
-										}
-										return daAnswers
-									}
+		//if we made it here, we don't have a decent A record from the NS.
+		fmt.Println("No A_Record for this NS")
+		return nil
 
-									for _, auth := range respo.Authorities {
-										setAuthAdd(auth)
-									}
-									for _, addit := range respo.Additionals {
-										setAuthAdd(addit)
-									}
-
-									//then search additionals!
-									found := false
-									for _, authEntry := range respo.Authorities {
-
-										nsRDat, exist := authEntry.RData.(NS_RECORD) //check for name exists
-										if !exist {
-											continue
-										}
-
-										if len(respo.Additionals) != 0 { //check for legitimate additional list
-
-											//fmt.Println("Additionals are:", respo.Additionals)
-											for _, additEntry := range respo.Additionals { //searching additionals
-
-												//find A_Record
-												arec, exist := additEntry.RData.(A_RECORD)
-												if !exist {
-													continue
-												}
-												//make sure it's the right one
-												if additEntry.RName == nsRDat.NS {
-													newAddr = arec.A
-													found = true
-													break
-												}
-
-											} //end check additionals for
-
-										} else {
-											//panic("ruh roh raggy (no additionals found lol)")
-											fmt.Println("No additionals!")
-											daAnswers = QueryLookup(nsRDat.NS, RTYPE_A)
-										} //end additional if check
-
-										if found {
-											break
-										}
-									}
-
-									if newAddr == addr {
-										fmt.Println("No improvement.")
-										break
-									}
-									addr = newAddr
-
-								} //end response parse if
-
-							} //end IP iterative for
-
-						} //end data search for
-
-					} //end valid entry if
-
-				} //end copy for
-
-				//break //woohooo
-			} //end found if
-
-		} //end suffix array search
-
-		//look one more time my guy TRUST
-		if cacheLookup(name, t) != nil {
-			daAnswers = QueryLookup(name, t)
-		}
 	} //end iterative lookup
 
 	return daAnswers
@@ -490,24 +443,45 @@ func chopName(name string) []string {
 	//get suffArray
 	for i := range pieces {
 		suff := strings.Join(pieces[i:], ".")
+		//fmt.Println(suff)
 		if suff != "" {
-			chopped = append(chopped, suff+".")
-		} else {
-			//accounts for trailing dot at end
+			chopped = append(chopped, suff)
+		}
+		if !strings.HasSuffix(suff, ".") {
+			//fmt.Println("we're appending! for some reason.")
 			chopped = append(chopped, ".")
 		}
 	}
+	//fmt.Println("Returning suffix array:", chopped)
 	return chopped //put it back
 }
 
+// traverse suffix array to get better NS
+func getBest(suffArr []string) string {
+	var currBest string
+	//fmt.Println(suffArr)
+	bestName := ""
+	for _, x := range suffArr {
+		//fmt.Println("Looking for", x)
+		if cacheLookup(x, RTYPE_NS) != nil {
+			currBest = x
+			if len(currBest) > len(bestName) {
+				bestName = currBest
+			}
+		}
+	}
+	return bestName
+}
+
 // makes setting the cache easier in QueryLookup
-func setAuthAdd(entry DNSAnswer) {
-	//fmt.Println("Info for current entry- Name:", entry.RName, "Type:", entry.RType, "Class:", entry.RClass, "Data:", entry.RData)
+func setAnsAuthAdd(entry DNSAnswer) {
 	name := entry.RName
 
 	if !strings.HasSuffix(name, ".") {
 		name += "."
 	}
+	fmt.Println("Info for current cache... Name:", name, "Type:", entry.RType, "Class:", entry.RClass, "Data:", entry.RData)
+
 	//caching found entry
 	//exist := cacheLookup(name, entry.RType)
 
